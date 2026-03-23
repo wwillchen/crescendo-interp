@@ -120,7 +120,7 @@ def select_direction(
     harmless_instructions,
     candidate_directions: Float[Tensor, 'n_pos n_layer d_model'],
     artifact_dir,
-    kl_threshold=0.1, # directions larger KL score are filtered out
+    kl_threshold=0.1, # directions with larger KL score are filtered out; "median" for auto
     induce_refusal_threshold=0.0, # directions with a lower inducing refusal score are filtered out
     prune_layer_percentage=0.2, # discard the directions extracted from the last 20% of the model
     batch_size=32
@@ -217,6 +217,12 @@ def select_direction(
         artifact_name='kl_div_scores'
     )
 
+    # Resolve "median" KL threshold: compute median of non-NaN KL scores
+    if kl_threshold == "median":
+        valid_kls = ablation_kl_div_scores[~ablation_kl_div_scores.isnan()]
+        kl_threshold = valid_kls.median().item()
+        print(f"Using median KL threshold: {kl_threshold:.4f} (range: [{valid_kls.min():.4f}, {valid_kls.max():.4f}])")
+
     filtered_scores = []
     json_output_all_scores = []
     json_output_filtered_scores = []
@@ -236,8 +242,7 @@ def select_direction(
             steering_score = steering_refusal_scores[source_pos, source_layer].item()
             kl_div_score = ablation_kl_div_scores[source_pos, source_layer].item()
 
-            # we sort the directions in descending order (from highest to lowest score)
-            # the intervention is better at bypassing refusal if the refusal score is low, so we multiply by -1
+            # Sort by refusal score (lower = better at bypassing refusal)
             sorting_score = -refusal_score
 
             # we filter out directions if the KL threshold

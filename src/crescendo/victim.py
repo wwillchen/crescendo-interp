@@ -179,3 +179,55 @@ class VictimModel:
                 h.remove()
 
         return activations
+
+    def extract_response_mean_activations(
+        self,
+        conversation: List[Dict[str, str]],
+        layers: Optional[List[int]] = None,
+    ) -> Dict[int, torch.Tensor]:
+        """Extract mean activations over the response tokens.
+
+        Matches the role-vector extraction method from Lu et al.:
+        format the full conversation (prompt + response), run a forward pass,
+        and average activations across all response token positions.
+
+        The conversation must include the latest assistant response.
+        """
+        if layers is None:
+            layers = list(range(self.n_layers))
+
+        # Format prompt (without response) to find where response tokens start
+        prompt_only = self.format_conversation(conversation[:-1], add_generation_prompt=True)
+        prompt_ids = self._tokenize(prompt_only)
+        response_start = prompt_ids.shape[1]
+
+        # Format full conversation (with response) — no generation prompt
+        full_conv = self.format_conversation(conversation, add_generation_prompt=False)
+        full_ids = self._tokenize(full_conv)
+        response_end = full_ids.shape[1]
+
+        if response_end <= response_start:
+            return {}
+
+        activations = {}
+        handles = []
+
+        def make_hook(layer_idx):
+            def hook_fn(module, inp, out):
+                act = out[0] if isinstance(out, tuple) else out
+                # Mean over response token positions
+                activations[layer_idx] = act[0, response_start:response_end, :].mean(dim=0).detach().cpu().float()
+            return hook_fn
+
+        for layer_idx in layers:
+            h = self.layers[layer_idx].register_forward_hook(make_hook(layer_idx))
+            handles.append(h)
+
+        try:
+            with torch.inference_mode():
+                self.model(full_ids)
+        finally:
+            for h in handles:
+                h.remove()
+
+        return activations

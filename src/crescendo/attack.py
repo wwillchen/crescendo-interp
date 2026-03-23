@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import torch
+
 from .attacker import AttackerClient
 from .victim import VictimModel
 from .tracker import ActivationTracker
@@ -26,6 +28,8 @@ class TurnRecord:
     assistant_proj: Dict[int, float] = field(default_factory=dict)
     cos_refusal: Dict[int, float] = field(default_factory=dict)
     cos_assistant: Dict[int, float] = field(default_factory=dict)
+    raw_activations: Optional[Dict[int, torch.Tensor]] = field(default=None, repr=False)
+    response_activations: Optional[Dict[int, torch.Tensor]] = field(default=None, repr=False)
 
 
 @dataclass
@@ -85,7 +89,7 @@ def run_crescendo(
             print(f"Tracking: DISABLED (no vectors)")
         print(f"{'='*60}")
 
-    while executed_turns < max_turns:
+    while executed_turns < max_turns and not achieved:
         turn_display = executed_turns + 1
         try:
             if verbose:
@@ -96,7 +100,6 @@ def run_crescendo(
                 current_turn=turn_display, max_turns=max_turns,
                 last_response=last_response, last_score=last_score,
                 last_score_rationale=last_rationale, refused_text=refused_text,
-                success_flag=achieved,
             )
             refused_text = None
 
@@ -109,12 +112,20 @@ def run_crescendo(
             if tracker.enabled:
                 activations = victim.extract_decision_point_activations(conversation, layers=None)
                 refusal_proj, assistant_proj, cos_refusal, cos_assistant = tracker.compute_projections(activations)
+                raw_acts = activations  # keep for PCA analysis
             else:
                 refusal_proj, assistant_proj, cos_refusal, cos_assistant = {}, {}, {}, {}
+                raw_acts = None
 
             # Generate victim response
             response = victim.generate_response(conversation)
             conversation.append({"role": "assistant", "content": response})
+
+            # Extract response-mean activations (matches role-vector extraction for PCA)
+            if tracker.enabled:
+                resp_acts = victim.extract_response_mean_activations(conversation, layers=None)
+            else:
+                resp_acts = None
 
             if verbose:
                 print(f"  Victim: {response[:200]}")
@@ -133,6 +144,8 @@ def run_crescendo(
                     assistant_response=response, was_refused=True, was_backtracked=True,
                     refusal_proj=refusal_proj, assistant_proj=assistant_proj,
                     cos_refusal=cos_refusal, cos_assistant=cos_assistant,
+                    raw_activations=raw_acts,
+                    response_activations=resp_acts,
                 ))
 
                 conversation.pop()
@@ -152,6 +165,8 @@ def run_crescendo(
                     assistant_response=response, was_refused=True, was_backtracked=True,
                     refusal_proj=refusal_proj, assistant_proj=assistant_proj,
                     cos_refusal=cos_refusal, cos_assistant=cos_assistant,
+                    raw_activations=raw_acts,
+                    response_activations=resp_acts,
                 ))
                 executed_turns += 1
                 last_response = None
@@ -175,6 +190,8 @@ def run_crescendo(
                 objective_score=score, score_rationale=rationale,
                 refusal_proj=refusal_proj, assistant_proj=assistant_proj,
                 cos_refusal=cos_refusal, cos_assistant=cos_assistant,
+                raw_activations=raw_acts,
+                response_activations=resp_acts,
             ))
 
             if score >= OBJECTIVE_SCORE_THRESHOLD and not achieved:
@@ -225,7 +242,26 @@ def save_result(result: ConversationResult, run_dir: Path, index: int):
     out_path = Path(run_dir) / f"conversation_{index:03d}.json"
     with open(out_path, "w") as f:
         json.dump(data, f, indent=2)
-    print(f"Saved: {out_path}")
+
+    # Save activations as companion .pt files for analysis
+    raw_acts = {}
+    resp_acts = {}
+    for t in result.turns:
+        if t.raw_activations:
+            raw_acts[t.turn] = t.raw_activations
+        if t.response_activations:
+            resp_acts[t.turn] = t.response_activations
+
+    saved = [str(out_path)]
+    if raw_acts:
+        acts_path = Path(run_dir) / f"activations_{index:03d}.pt"
+        torch.save(raw_acts, str(acts_path))
+        saved.append(str(acts_path))
+    if resp_acts:
+        resp_path = Path(run_dir) / f"response_activations_{index:03d}.pt"
+        torch.save(resp_acts, str(resp_path))
+        saved.append(str(resp_path))
+    print(f"Saved: {' + '.join(saved)}")
 
 
 def print_trajectory_summary(result: ConversationResult, tracker: ActivationTracker):

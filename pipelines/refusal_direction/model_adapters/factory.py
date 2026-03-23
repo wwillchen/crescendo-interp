@@ -2,6 +2,9 @@ from model_adapters.base import ModelBase
 
 def construct_model_base(model_path: str) -> ModelBase:
 
+    if 'qwen' in model_path.lower() and ('qwen2' in model_path.lower() or 'qwen3' in model_path.lower()):
+        from model_adapters.qwen3 import Qwen3Model
+        return Qwen3Model(model_path)
     if 'qwen' in model_path.lower():
         from model_adapters.qwen import QwenModel
         return QwenModel(model_path)
