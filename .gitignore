@@ -44,3 +44,7 @@ Thumbs.db
 
 # HuggingFace cache
 *.cache/
+
+# Heavy / regeneratable
+outputs/
+slurm/
