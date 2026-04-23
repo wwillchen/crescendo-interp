@@ -23,6 +23,7 @@ pipelines/refusal_direction/runs/
 
 # Experiment results (regeneratable)
 experiments/crescendo_runs/
+experiments/pyrit_comparison/
 
 # SLURM logs
 slurm/logs/
@@ -47,4 +48,7 @@ Thumbs.db
 
 # Heavy / regeneratable
 outputs/
-slurm/
+
+# One-off release/distribution bundles
+*.tar.gz
+gemma-3-12b-refusal-direction/

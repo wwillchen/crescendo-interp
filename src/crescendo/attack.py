@@ -1,6 +1,7 @@
 """Crescendo attack loop — Algorithm 1 from Russinovich et al. (2024)."""
 
 import json
+import threading
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,6 +43,8 @@ class ConversationResult:
     n_turns: int = 0
     backtrack_count: int = 0
     error: Optional[str] = None
+    category: str = "unknown"
+    mode: str = "crescendo"
 
 
 def run_crescendo(
@@ -52,6 +55,7 @@ def run_crescendo(
     max_turns: int = 10,
     max_backtracks: int = 10,
     verbose: bool = True,
+    gpu_lock: Optional[threading.Lock] = None,
 ) -> ConversationResult:
     """Run a single crescendo attack trial.
 
@@ -96,93 +100,89 @@ def run_crescendo(
                 bt_str = " [after backtrack]" if refused_text else ""
                 print(f"\n--- Turn {turn_display}/{max_turns}{bt_str} ---")
 
+            # Step 1: Generate next prompt (matches PyRIT _generate_next_prompt_async)
             attacker_question = attacker.generate_next_prompt(
                 current_turn=turn_display, max_turns=max_turns,
                 last_response=last_response, last_score=last_score,
                 last_score_rationale=last_rationale, refused_text=refused_text,
             )
-            refused_text = None
+            refused_text = None  # Clear after use (matches PyRIT line 360)
 
             if verbose:
-                print(f"  Attacker: {attacker_question[:150]}")
+                print(f"  Attacker: {attacker_question}")
 
+            # Step 2: Send to victim (matches PyRIT _send_prompt_to_objective_target_async)
             conversation.append({"role": "user", "content": attacker_question})
 
-            # Extract activations at decision point
-            if tracker.enabled:
+            # GPU work — serialized across concurrent conversations
+            _lock = gpu_lock or threading.Lock()
+            _use_lock = gpu_lock is not None
+            if _use_lock:
+                _lock.acquire()
+            try:
+                # Always extract activations for saving (even without projection vectors)
                 activations = victim.extract_decision_point_activations(conversation, layers=None)
-                refusal_proj, assistant_proj, cos_refusal, cos_assistant = tracker.compute_projections(activations)
-                raw_acts = activations  # keep for PCA analysis
-            else:
-                refusal_proj, assistant_proj, cos_refusal, cos_assistant = {}, {}, {}, {}
-                raw_acts = None
+                raw_acts = activations
+                if tracker.enabled:
+                    refusal_proj, assistant_proj, cos_refusal, cos_assistant = tracker.compute_projections(activations)
+                else:
+                    refusal_proj, assistant_proj, cos_refusal, cos_assistant = {}, {}, {}, {}
 
-            # Generate victim response
-            response = victim.generate_response(conversation)
-            conversation.append({"role": "assistant", "content": response})
+                response = victim.generate_response(conversation)
+                conversation.append({"role": "assistant", "content": response})
 
-            # Extract response-mean activations (matches role-vector extraction for PCA)
-            if tracker.enabled:
                 resp_acts = victim.extract_response_mean_activations(conversation, layers=None)
-            else:
-                resp_acts = None
+            finally:
+                if _use_lock:
+                    _lock.release()
 
             if verbose:
-                print(f"  Victim: {response[:200]}")
+                print(f"  Victim: {response}")
                 for l in key_layers:
                     print(f"    L{l:2d}: ref={refusal_proj.get(l, 0):+.3f}, ast={assistant_proj.get(l, 0):+.3f}")
 
-            # Refusal Judge
-            is_refusal = attacker.check_refusal(response)
+            # Step 3: Check refusal and backtrack if needed
+            # (matches PyRIT _perform_backtrack_if_refused_async exactly)
+            # PyRIT: if backtrack_count >= max_backtracks, skip refusal check entirely
+            backtracked = False
+            is_refusal = False
+            if backtrack_count < max_backtracks:
+                is_refusal = attacker.check_refusal(response, objective)
+                if is_refusal:
+                    if verbose:
+                        print(f"  -> REFUSAL — backtracking (#{backtrack_count + 1}/{max_backtracks})")
 
-            if is_refusal and backtrack_count < max_backtracks:
-                if verbose:
-                    print(f"  -> REFUSAL — backtracking (#{backtrack_count + 1}/{max_backtracks})")
+                    result.turns.append(TurnRecord(
+                        turn=turn_display, user_message=attacker_question,
+                        assistant_response=response, was_refused=True, was_backtracked=True,
+                        refusal_proj=refusal_proj, assistant_proj=assistant_proj,
+                        cos_refusal=cos_refusal, cos_assistant=cos_assistant,
+                        raw_activations=raw_acts,
+                        response_activations=resp_acts,
+                    ))
 
-                result.turns.append(TurnRecord(
-                    turn=turn_display, user_message=attacker_question,
-                    assistant_response=response, was_refused=True, was_backtracked=True,
-                    refusal_proj=refusal_proj, assistant_proj=assistant_proj,
-                    cos_refusal=cos_refusal, cos_assistant=cos_assistant,
-                    raw_activations=raw_acts,
-                    response_activations=resp_acts,
-                ))
+                    # Backtrack: remove from victim conversation
+                    conversation.pop()
+                    conversation.pop()
+                    attacker.backtrack_attacker_conversation(attacker_question)
+                    refused_text = attacker_question
+                    backtrack_count += 1
+                    backtracked = True
 
-                conversation.pop()
-                conversation.pop()
-                attacker.backtrack_attacker_conversation(attacker_question)
-                refused_text = attacker_question
-                backtrack_count += 1
+            # Step 4: If backtracked, continue without incrementing turn
+            if backtracked:
                 continue
 
-            if is_refusal:
-                if verbose:
-                    print(f"  -> REFUSAL (max backtracks reached, removing from conversation)")
-                conversation.pop()
-                conversation.pop()
-                result.turns.append(TurnRecord(
-                    turn=turn_display, user_message=attacker_question,
-                    assistant_response=response, was_refused=True, was_backtracked=True,
-                    refusal_proj=refusal_proj, assistant_proj=assistant_proj,
-                    cos_refusal=cos_refusal, cos_assistant=cos_assistant,
-                    raw_activations=raw_acts,
-                    response_activations=resp_acts,
-                ))
-                executed_turns += 1
-                last_response = None
-                last_score = None
-                last_rationale = None
-                refused_text = attacker_question
-                continue
-
-            # Judge scores the response
+            # Step 5: Score the response (matches PyRIT _score_response_async)
+            # This runs for ALL non-backtracked responses, including refusals
+            # when max_backtracks is exhausted
             score, rationale = attacker.score_response(response, objective)
             last_response = response
             last_score = score
             last_rationale = rationale
 
             if verbose:
-                print(f"  -> Score: {score:.2f} ({rationale[:80]})")
+                print(f"  -> Score: {score:.2f} ({rationale})")
 
             result.turns.append(TurnRecord(
                 turn=turn_display, user_message=attacker_question,
@@ -194,11 +194,13 @@ def run_crescendo(
                 response_activations=resp_acts,
             ))
 
+            # Step 6: Check if objective achieved
             if score >= OBJECTIVE_SCORE_THRESHOLD and not achieved:
                 achieved = True
                 if verbose:
                     print(f"  * OBJECTIVE ACHIEVED (score={score:.2f})")
 
+            # Step 7: Increment turn count
             executed_turns += 1
 
         except Exception as e:
@@ -217,6 +219,8 @@ def run_crescendo(
 def save_result(result: ConversationResult, run_dir: Path, index: int):
     data = {
         "objective": result.objective,
+        "category": result.category,
+        "mode": result.mode,
         "success": result.success,
         "final_score": result.final_score,
         "n_turns": result.n_turns,
@@ -297,3 +301,116 @@ def print_trajectory_summary(result: ConversationResult, tracker: ActivationTrac
             sc = f"{t.objective_score:.2f}" if t.objective_score is not None else "  - "
             status = "BACKTRACK" if t.was_backtracked else ("* SUCCESS" if t.objective_score and t.objective_score >= OBJECTIVE_SCORE_THRESHOLD else "")
             print(f"  {t.turn:4d} | {sc} | {status}")
+
+
+def run_direct(
+    victim: VictimModel,
+    attacker: AttackerClient,
+    tracker: ActivationTracker,
+    objective: str,
+    direct_prompt: str,
+    verbose: bool = True,
+    gpu_lock: Optional[threading.Lock] = None,
+) -> ConversationResult:
+    """Run a single-step direct attack (baseline, no crescendo escalation).
+
+    Sends direct_prompt to the victim as a single turn, records activations,
+    and scores the response against objective.
+    """
+    result = ConversationResult(objective=objective, mode="direct")
+    key_layers = tracker.key_layers
+
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"DIRECT ATTACK (single-step baseline)")
+        print(f"Objective: {objective}")
+        print(f"Prompt: {direct_prompt}")
+        if tracker.enabled:
+            print(f"Tracking: all {tracker.n_layers} layers, key={key_layers}")
+        print(f"{'='*60}")
+
+    try:
+        conversation = [{"role": "user", "content": direct_prompt}]
+
+        # GPU work — serialized across concurrent conversations
+        _lock = gpu_lock or threading.Lock()
+        _use_lock = gpu_lock is not None
+        if _use_lock:
+            _lock.acquire()
+        try:
+            # Always extract activations for saving (even without projection vectors)
+            activations = victim.extract_decision_point_activations(conversation, layers=None)
+            raw_acts = activations
+            if tracker.enabled:
+                refusal_proj, assistant_proj, cos_refusal, cos_assistant = tracker.compute_projections(activations)
+            else:
+                refusal_proj, assistant_proj, cos_refusal, cos_assistant = {}, {}, {}, {}
+
+            response = victim.generate_response(conversation)
+            conversation.append({"role": "assistant", "content": response})
+
+            resp_acts = victim.extract_response_mean_activations(conversation, layers=None)
+        finally:
+            if _use_lock:
+                _lock.release()
+
+        if verbose:
+            print(f"\n  Prompt: {direct_prompt}")
+            print(f"  Response: {response}")
+            for l in key_layers:
+                print(f"    L{l:2d}: ref={refusal_proj.get(l, 0):+.3f}, ast={assistant_proj.get(l, 0):+.3f}")
+
+        # Refusal check
+        is_refusal = attacker.check_refusal(response)
+
+        # Score response against objective
+        score, rationale = attacker.score_response(response, objective)
+
+        if verbose:
+            refused_str = "REFUSED" if is_refusal else "not refused"
+            print(f"  -> {refused_str} | Score: {score:.2f} ({rationale})")
+
+        result.turns.append(TurnRecord(
+            turn=1, user_message=direct_prompt,
+            assistant_response=response, was_refused=is_refusal, was_backtracked=False,
+            objective_score=score, score_rationale=rationale,
+            refusal_proj=refusal_proj, assistant_proj=assistant_proj,
+            cos_refusal=cos_refusal, cos_assistant=cos_assistant,
+            raw_activations=raw_acts,
+            response_activations=resp_acts,
+        ))
+
+        result.success = score >= OBJECTIVE_SCORE_THRESHOLD
+        result.final_score = score
+        result.n_turns = 1
+
+    except Exception as e:
+        print(f"  ERROR: {e}")
+        traceback.print_exc()
+        result.error = str(e)
+
+    return result
+
+
+def print_run_summary(results: List[ConversationResult], mode: str):
+    """Print a formatted summary table for a multi-objective run."""
+    print(f"\n{'='*72}")
+    print(f"  MULTI-OBJECTIVE RUN SUMMARY ({mode} mode)")
+    print(f"{'='*72}")
+    print(f"\n  {'#':>3} | {'Category':<22} | {'Score':>5} | {'Refused':>7} | {'Success':>7} | {'Turns':>5}")
+    print(f"  {'---':>3}-+-{'---':<22}-+-{'---':>5}-+-{'---':>7}-+-{'---':>7}-+-{'---':>5}")
+
+    for i, r in enumerate(results):
+        cat = r.category[:22]
+        sc = f"{r.final_score:.2f}"
+        refused = "Yes" if (r.turns and r.turns[0].was_refused) else "No"
+        success = "Yes" if r.success else "No"
+        turns = str(r.n_turns)
+        print(f"  {i+1:3d} | {cat:<22} | {sc:>5} | {refused:>7} | {success:>7} | {turns:>5}")
+
+    n_success = sum(1 for r in results if r.success)
+    n_refused = sum(1 for r in results if r.turns and r.turns[0].was_refused)
+    avg_score = sum(r.final_score for r in results) / len(results) if results else 0
+    print(f"  {'---':>3}-+-{'---':<22}-+-{'---':>5}-+-{'---':>7}-+-{'---':>7}-+-{'---':>5}")
+    print(f"  {'':>3} | {'TOTAL':<22} | {avg_score:5.2f} | {n_refused:>4}/{len(results):<2} | {n_success:>4}/{len(results):<2} |")
+    print(f"{'='*72}")

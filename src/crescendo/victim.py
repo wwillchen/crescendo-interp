@@ -50,15 +50,20 @@ class VictimModel:
         self.layers = self._get_layers()
         self.n_layers = len(self.layers)
 
-        self.hidden_size = self.model.config.hidden_size
+        # Gemma 3 nests text config under text_config (ConditionalGeneration)
+        cfg = self.model.config
+        if hasattr(cfg, "text_config"):
+            cfg = cfg.text_config
+        self.hidden_size = cfg.hidden_size
 
         gen_mode = "model.generate()" if self._can_use_generate else "manual loop (Qwen 1.x)"
         print(f"  Loaded: {self.n_layers} layers, hidden_size={self.hidden_size}, generation={gen_mode}")
 
     def _get_layers(self):
         paths = [
-            lambda m: m.model.layers,       # Llama, Gemma 2, Qwen 2+
-            lambda m: m.transformer.h,      # Qwen 1.x, GPT-style
+            lambda m: m.model.layers,                    # Llama, Gemma 2, Qwen 2+
+            lambda m: m.model.language_model.layers,     # Gemma 3 (ConditionalGeneration)
+            lambda m: m.transformer.h,                   # Qwen 1.x, GPT-style
         ]
         for path_fn in paths:
             try:
